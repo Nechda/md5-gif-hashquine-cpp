@@ -1,0 +1,1 @@
+The original idea and algorithm were outlined in the article https://www.rogdham.net/2017/03/12/gif-md5-hashquine.en

@@ -1,24 +1,15 @@
 #include <iostream>
 #include <string>
-#include <fstream>
-#include <sstream>
+#include <cstring>
 #include <vector>
-#include <unordered_map>
 #include <map>
+#include <cassert>
+#include <fstream>
+#include <filesystem>
 
+#include "md5.hpp"
 
-#include <boost/uuid/detail/md5.hpp>
-#include <boost/algorithm/hex.hpp>
-
-using boost::uuids::detail::md5;
-
-std::string toString(const md5::digest_type &digest)
-{
-    const auto charDigest = reinterpret_cast<const char *>(&digest);
-    std::string result;
-    boost::algorithm::hex(charDigest, charDigest + sizeof(md5::digest_type), std::back_inserter(result));
-    return result;
-}
+#define USE_DUMB_COLL_GENERATOR 0
 
 constexpr int COLLISION_LEN = 128;
 constexpr int COLLISION_LAST_DIFF = 123;
@@ -26,7 +17,36 @@ constexpr int COLLISION_LAST_DIFF = 123;
 using byte_seq = std::vector<uint8_t>;
 using string_pair = std::pair<byte_seq, byte_seq>;
 
+void operator+=(byte_seq &lhs, const byte_seq &rhs) {
+    lhs.insert(lhs.end(), rhs.begin(), rhs.end());
+}
+
+template<uint8_t value> struct PAD {PAD(size_t sz) : count{sz} {}; size_t count = 0;};
+template<uint8_t value>
+void operator+=(byte_seq &lhs, PAD<value> pad) {
+    lhs.resize(lhs.size() + pad.count);
+    auto last = lhs.size() - 1;
+    for(int i = 0; i < pad.count; i++)
+        lhs[last - i] = value;
+}
+
+uint32_t seed32_1, seed32_2;
+inline uint32_t xrng64()
+{
+	uint32_t t = seed32_1 ^ (seed32_1 << 10);
+	seed32_1 = seed32_2;
+	seed32_2 = (seed32_2^(seed32_2>>10))^(t^(t>>13));
+	return seed32_1;
+}
+
 string_pair collide(byte_seq &prefix) {
+    /*
+        This function -- wrapper for util for generation
+        md5 collision.
+
+        Download and compile it from http://www.win.tue.nl/hashclash/
+    */
+    #if !USE_DUMB_COLL_GENERATOR
     string_pair answ;
     {
         std::fstream out(".prefix", std::ios::out | std::ios::binary);
@@ -57,10 +77,20 @@ string_pair collide(byte_seq &prefix) {
     if(answ.first[COLLISION_LAST_DIFF] >= answ.second[COLLISION_LAST_DIFF])
         std::swap(answ.first, answ.second);
     return answ;
+    #else
+    string_pair answ;
+    answ.first.resize(128);
+    answ.second.resize(128);
+    for(int i = 0; i < 128; i++) {
+        answ.first[i] = xrng64();
+        answ.second[i] = xrng64();
+    }
+    return answ;
+    #endif
 }
 
 auto read_gif(std::string filename) {
-    std::unordered_map<std::string, byte_seq> blocks;
+    std::map<std::string, byte_seq> blocks;
     FILE* gif_fd = fopen(filename.c_str(), "rb");
     
     byte_seq buf;
@@ -77,24 +107,27 @@ auto read_gif(std::string filename) {
 
     blocks["img_data"] = read_bytes(1);
     while(true) {
-        auto tmp = read_bytes(1);
-        auto &a = blocks["img_data"];
-        auto &b = tmp;
-        a.insert(a.end(), b.begin(), b.end()); // concat vectors
-        if(a.back() == 0) break;
-
-        tmp = read_bytes(a.back());
-        a.insert(a.end(), b.begin(), b.end()); // concat vectors
+        auto &block = blocks["img_data"];
+        block += read_bytes(1);
+        if(block.back() == 0) break;
+        block += read_bytes(block.back());
     }
     fclose(gif_fd);
 
     return blocks;
 }
 
-void generate() {
+byte_seq generate() {
+    // position of md5 hash in generated gif
+    uint16_t top = 102;
+    uint16_t left = 0;
+
     byte_seq control_extention{0x21, 0xf9, 0x04, 0x04, 0x02, 0x00, 0x00, 0x00};
     uint16_t char_width;
     uint16_t char_height;
+
+    // read initial gifs
+    auto background = read_gif("background.gif");
 
     std::vector<byte_seq> chars_img_data(16);
     constexpr std::string_view HEX_DIGITS = "0123456789abcdef";
@@ -105,58 +138,47 @@ void generate() {
         auto blocks = read_gif(filename);
         chars_img_data[i] = blocks["img_data"];
         auto &desc = blocks["img_descriptor"];
-        char_width = (desc[5] << 8) | desc[6];
-        char_height = (desc[7] << 8) | desc[8];
+        char_width = desc[5] | (desc[6] << 8);
+        char_height = desc[7] | (desc[8] << 8);
     }
 
     
-    // (char_pos, char): (coll_pos, coll)
+    // (char_pos, char) -> (coll_pos, coll)
     std::map<std::pair<int, int>, std::pair<int, byte_seq>> alternatives;
-
-    auto concat = [](byte_seq &a, const byte_seq &b) {
-        a.insert(a.end(), b.begin(), b.end());
-    };
-    auto background = read_gif("template/background.gif");
 
     // header
     byte_seq generated_gif = background["header"];
-    concat(generated_gif, background["lcd"]);
-    concat(generated_gif, background["gct"]);
-
-    generated_gif.reserve(1024 * 1024);
+    generated_gif += background["lcd"];
+    generated_gif += background["gct"];
 
     // background
-    concat(generated_gif, control_extention);
-    concat(generated_gif, background["img_descriptor"]);
-    concat(generated_gif, background["img_data"]);
+    generated_gif += control_extention;
+    generated_gif += background["img_descriptor"];
+    generated_gif += background["img_data"];
 
     // start comment
-    concat(generated_gif, byte_seq{0x21, 0xfe});
+    generated_gif += byte_seq{0x21, 0xfe};
 
-    uint16_t top = 102;
-    uint16_t left = 143;
     for(int char_pos = 0; char_pos < 32; char_pos++) {
-        left += char_width;
         for(int cha = 0; cha < 16; cha++) {
             byte_seq char_img = control_extention;
-            char_img.push_back('<');
-            char_img.push_back('H');
-            char_img.push_back('H');
-            char_img.push_back('H');
+            char_img.push_back(0x2c);
             #define push_u16(value) \
-                char_img.push_back(value >> 8); char_img.push_back(value && 0xFF);
+                char_img.push_back(value & 0xFF); char_img.push_back(value >> 8); 
             push_u16(left);
             push_u16(top);
             push_u16(char_width);
             push_u16(char_height);
             #undef push_u16
-            concat(char_img, chars_img_data[cha]);
+            char_img.push_back(0x00);
+
+            char_img += chars_img_data[cha];
 
             auto coll_diff = COLLISION_LAST_DIFF;
             auto align = 64 - generated_gif.size() % 64;
             generated_gif.push_back(align - 1 + coll_diff);
-            for(int i = 0; i < align - 1; i++) generated_gif.push_back(0x00);
-
+            generated_gif += PAD<0x00>(align - 1);
+            
 
             byte_seq coll_img;
             byte_seq coll_nop;
@@ -179,33 +201,30 @@ void generate() {
 
             alternatives[{char_pos, cha}] = {generated_gif.size(), coll_img};
 
-            concat(generated_gif, coll_nop);
-            for(int i = 0; i < coll_p_img; i++) generated_gif.push_back(0x00);
+            generated_gif += coll_nop;
+            generated_gif += PAD<0x00>(coll_p_img);
             generated_gif.push_back(0x00); // end comment
 
             // insert char image
-            concat(generated_gif, char_img);
+            generated_gif += char_img;
 
             // start new comment
             generated_gif.push_back(0x21);
             generated_gif.push_back(0xfe);
             generated_gif.push_back(pad_len);
-            for(int i = 0; i < pad_len; i++) generated_gif.push_back(0x00);
+            generated_gif += PAD<0x00>(pad_len);
         }
+        left += char_width;
     }
 
 
     auto result_hash = [&](){
-        md5 hash;
-        md5::digest_type digest;
-        hash.process_bytes(generated_gif.data(), generated_gif.size());
-        hash.get_digest(digest);
-        auto str = toString(digest);
-        byte_seq result_hash(str.size(), 0);
-        for(int i = 0; i < result_hash.size(); i++) {
-            std::string s{str[i]};
-            result_hash[i] = std::stoul(s,nullptr,16);
+        auto hash = MD5()(generated_gif.data(), generated_gif.size());
+        byte_seq result_hash(hash.size(), 0);
+        for(int i = 0; i < hash.size(); i++) {
+            result_hash[i] = HEX_DIGITS.find(std::tolower(hash[i]), 0);
         }
+        std::cout << "md5 = " << hash << std::endl; 
         return result_hash;
     }();
     
@@ -215,16 +234,19 @@ void generate() {
         std::memcpy(generated_gif.data() + coll_pos, coll.data(), coll.size());
     }
 
-
-    {
-        FILE *out = fopen("hashquine.gif", "wb");
-        fwrite(generated_gif.data(), 1, generated_gif.size(), out);
-        fclose(out);
-    }
-
+    return generated_gif;
 }
 
 int main() {
-    generate();
+
+    seed32_1 = time(NULL);
+	seed32_2 = 0x12345678;
+
+    auto generated_gif = generate();
+
+    FILE *out = fopen("hashquine.gif", "wb");
+    fwrite(generated_gif.data(), sizeof(uint8_t), generated_gif.size(), out);
+    fclose(out);
+
     return 0;
 }
